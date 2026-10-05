@@ -1,0 +1,7 @@
+# TRAE tool artifacts
+.trae-html-share-packages/
+
+# OS files
+.DS_Store
+Thumbs.db
+desktop.ini
