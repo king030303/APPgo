@@ -1,0 +1,116 @@
+name: publish-apk
+
+# 为什么要有这条流水线：
+#   APK 有 128.5 MB，超过 GitHub 单文件 100 MB 的硬限，**不能直接 commit 进仓库**；
+#   走 Releases 附件（单资产上限 2 GB、不限下载带宽）。附件只能由 API 创建，
+#   而这里用的是 Actions 自带的 GITHUB_TOKEN —— 所以**不需要任何人提供 PAT**。
+#   好处还在于：以后换版本只改 release.json 再 push，附件自动重发、URL 不变规则。
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "release.json"
+      - ".github/workflows/publish-apk.yml"
+  workflow_dispatch:
+
+# 创建 Release 必须写 contents；其余一律不给。
+permissions:
+  contents: write
+
+concurrency:
+  group: publish-apk
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 读取 release.json
+        id: meta
+        run: |
+          python3 - <<'PY'
+          import json, os
+          m = json.load(open('release.json', encoding='utf-8'))
+          out = os.environ['GITHUB_OUTPUT']
+          keys = ('tag', 'name', 'version_name', 'version_code', 'asset_name',
+                  'source_url', 'mirror_url', 'sha256', 'size', 'abi', 'min_android')
+          with open(out, 'a', encoding='utf-8') as f:
+              for k in keys:
+                  f.write('%s=%s\n' % (k, m[k]))
+          print('tag=%s asset=%s size=%s' % (m['tag'], m['asset_name'], m['size']))
+          PY
+
+      - name: 下载安装包（源站 / R2）
+        run: |
+          # ⚠️ 必须带 UA：CF 对无 UA 的请求直接 403(1010)。
+          curl -fL --retry 3 --retry-delay 5 --retry-all-errors \
+               -A "publish-apk (+https://github.com/${{ github.repository }})" \
+               --max-time 900 \
+               -o "${{ steps.meta.outputs.asset_name }}" \
+               "${{ steps.meta.outputs.source_url }}"
+
+      - name: 校验 sha256 与体积（不符即失败，绝不发出坏包）
+        run: |
+          f="${{ steps.meta.outputs.asset_name }}"
+          want="${{ steps.meta.outputs.sha256 }}"
+          wsize="${{ steps.meta.outputs.size }}"
+          got=$(sha256sum "$f" | cut -d' ' -f1)
+          size=$(stat -c%s "$f")
+          echo "sha256(want): $want"
+          echo "sha256(got) : $got"
+          echo "size(want)  : $wsize"
+          echo "size(got)   : $size"
+          if [ "$got" != "$want" ]; then
+            echo "::error::sha256 不符，拒绝发布（源文件可能被替换或下载被截断）"
+            exit 1
+          fi
+          if [ "$size" != "$wsize" ]; then
+            echo "::error::体积不符，拒绝发布"
+            exit 1
+          fi
+
+      - name: 创建或更新 Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          tag="${{ steps.meta.outputs.tag }}"
+          asset="${{ steps.meta.outputs.asset_name }}"
+          repo="${{ github.repository }}"
+
+          notes=$(cat <<EOF
+          **深秘TV ${{ steps.meta.outputs.version_name }}**（versionCode ${{ steps.meta.outputs.version_code }}）
+
+          - ABI：\`${{ steps.meta.outputs.abi }}\`
+          - 最低系统：Android ${{ steps.meta.outputs.min_android }}
+          - 体积：\`${{ steps.meta.outputs.size }}\` 字节
+          - SHA-256：\`${{ steps.meta.outputs.sha256 }}\`
+
+          直链（本页附件即最稳的一条）：
+
+          - GitHub：\`https://github.com/${repo}/releases/download/${tag}/${asset}\`
+          - R2：\`${{ steps.meta.outputs.source_url }}\`
+          - 源站：\`${{ steps.meta.outputs.mirror_url }}\`
+          EOF
+          )
+
+          if gh release view "$tag" --repo "$repo" >/dev/null 2>&1; then
+            echo "Release $tag 已存在 ⇒ 覆盖附件"
+            gh release upload "$tag" "$asset" --repo "$repo" --clobber
+            gh release edit "$tag" --repo "$repo" --title "${{ steps.meta.outputs.name }}" --notes "$notes" --latest
+          else
+            echo "创建 Release $tag"
+            gh release create "$tag" "$asset" --repo "$repo" \
+              --title "${{ steps.meta.outputs.name }}" \
+              --notes "$notes" \
+              --latest
+          fi
+
+      - name: 回执
+        run: |
+          echo "### 已发布 ${{ steps.meta.outputs.name }}" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "https://github.com/${{ github.repository }}/releases/download/${{ steps.meta.outputs.tag }}/${{ steps.meta.outputs.asset_name }}" >> "$GITHUB_STEP_SUMMARY"
